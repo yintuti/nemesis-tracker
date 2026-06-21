@@ -1,0 +1,45 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+}
+
+.language-toggle {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 20;
+  min-width: 3rem;
+  height: 2.25rem;
+  border: 1px solid rgba(200, 155, 60, 0.45);
+  border-radius: 2px;
+  background: rgba(10, 20, 30, 0.88);
+  color: #c89b3c;
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s, background 0.2s;
+}
+
+.language-toggle:hover,
+.language-toggle:focus-visible {
+  border-color: rgba(200, 155, 60, 0.8);
+  background: rgba(18, 32, 45, 0.94);
+  color: #f0e6d3;
+  outline: none;
+}
+
+@media (max-width: 480px) {
+  .language-toggle {
+    top: 0.75rem;
+    right: 0.75rem;
+    min-width: 2.75rem;
+    height: 2rem;
+  }
+}
