@@ -12,6 +12,7 @@ async def get_nemesis_data(puuid: str, pool: aiomysql.Pool) -> dict:
                     opponent_champion,
                     wins,
                     losses,
+                    wins + losses as total,
                     is_lane_opponent,
                     ROUND(wins / (wins + losses) * 100, 1) as winrate
                 FROM matchup_stats
@@ -76,12 +77,14 @@ async def get_matchups_by_champion_played(puuid: str, champion: str, pool: aiomy
                     mh.opponent_champion,
                     SUM(mh.win) as wins,
                     SUM(1 - mh.win) as losses,
+                    COUNT(*) as total,
                     ROUND(SUM(mh.win) / COUNT(*) * 100, 1) as winrate
                 FROM match_history mh
                 WHERE mh.puuid = %s AND mh.champion_played = %s
                 AND mh.opponent_champion IS NOT NULL
                 GROUP BY mh.opponent_champion
-                ORDER BY winrate ASC
+                HAVING total > 0
+                ORDER BY total DESC, winrate ASC, mh.opponent_champion ASC
                 """,
                 (puuid, champion),
             )

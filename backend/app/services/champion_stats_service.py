@@ -65,7 +65,7 @@ async def get_champion_stats(puuid: str, pool: aiomysql.Pool) -> list:
                     ROUND(wins / (wins + losses) * 100, 1) as winrate
                 FROM champion_stats
                 WHERE puuid = %s AND (wins + losses) > 0
-                ORDER BY winrate DESC, total DESC
+                ORDER BY total DESC, winrate DESC, champion ASC
                 """,
                 (puuid,),
             )

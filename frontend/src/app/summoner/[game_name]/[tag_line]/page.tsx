@@ -15,6 +15,8 @@ import {
 } from '@/i18n';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const FALLBACK_DDRAGON_VERSION = '15.24.1';
+const ALL_FILTER_VALUE = 'all';
 
 const LOADING_STEPS: LoadingStepKey[] = [
   'locatingSummoner',
@@ -23,9 +25,32 @@ const LOADING_STEPS: LoadingStepKey[] = [
   'preparingDashboard',
 ];
 
-function getChampionIcon(championName: string) {
-  const normalized = championName.replace(/\s/g, '');
-  return `https://ddragon.leagueoflegends.com/cdn/14.9.1/img/champion/${normalized}.png`;
+const CHAMPION_IMAGE_OVERRIDES: Record<string, string> = {
+  BelVeth: 'Belveth',
+  "Bel'Veth": 'Belveth',
+  ChoGath: 'Chogath',
+  "Cho'Gath": 'Chogath',
+  KaiSa: 'Kaisa',
+  "Kai'Sa": 'Kaisa',
+  KhaZix: 'Khazix',
+  "Kha'Zix": 'Khazix',
+  VelKoz: 'Velkoz',
+  "Vel'Koz": 'Velkoz',
+  MonkeyKing: 'MonkeyKing',
+  Wukong: 'MonkeyKing',
+  'Nunu & Willump': 'Nunu',
+  'Renata Glasc': 'Renata',
+};
+
+type ResultFilter = 'all' | 'winning' | 'losing';
+type SortMode = 'games' | 'worst' | 'best';
+
+function getChampionAssetId(championName: string) {
+  return CHAMPION_IMAGE_OVERRIDES[championName] ?? championName.replace(/[^A-Za-z0-9]/g, '');
+}
+
+function getChampionIcon(championName: string, version: string) {
+  return `https://ddragon.leagueoflegends.com/cdn/${version}/img/champion/${getChampionAssetId(championName)}.png`;
 }
 
 type Summoner = {
@@ -48,6 +73,7 @@ type MatchupStats = {
   opponent_champion: string;
   wins: number;
   losses: number;
+  total: number;
   winrate: number;
   class: string;
 };
@@ -56,6 +82,7 @@ type ClassStats = {
   class: string;
   wins: number;
   losses: number;
+  total: number;
   winrate: number;
 };
 
@@ -75,8 +102,48 @@ type ChampionStats = {
   champion: string;
   wins: number;
   losses: number;
+  total: number;
   winrate: number;
 };
+
+function getMatchupTotal(matchup: Pick<MatchupStats, 'wins' | 'losses' | 'total'>) {
+  return matchup.total ?? matchup.wins + matchup.losses;
+}
+
+function compareMatchups(a: MatchupStats, b: MatchupStats, sortMode: SortMode) {
+  const totalDifference = getMatchupTotal(b) - getMatchupTotal(a);
+
+  if (sortMode === 'games') {
+    return totalDifference || a.winrate - b.winrate || a.opponent_champion.localeCompare(b.opponent_champion);
+  }
+
+  if (sortMode === 'best') {
+    return b.winrate - a.winrate || totalDifference || a.opponent_champion.localeCompare(b.opponent_champion);
+  }
+
+  return a.winrate - b.winrate || totalDifference || a.opponent_champion.localeCompare(b.opponent_champion);
+}
+
+function filterAndSortMatchups(
+  matchups: MatchupStats[],
+  classFilter: string,
+  resultFilter: ResultFilter,
+  sortMode: SortMode,
+) {
+  return matchups
+    .filter((matchup) => getMatchupTotal(matchup) > 0)
+    .filter((matchup) => classFilter === ALL_FILTER_VALUE || matchup.class === classFilter)
+    .filter((matchup) => {
+      if (resultFilter === 'winning') return matchup.wins > matchup.losses;
+      if (resultFilter === 'losing') return matchup.losses > matchup.wins;
+      return true;
+    })
+    .sort((a, b) => compareMatchups(a, b, sortMode));
+}
+
+function getClassOptions(matchups: MatchupStats[]) {
+  return Array.from(new Set(matchups.map((matchup) => matchup.class))).sort();
+}
 
 export default function SummonerPage() {
   const params = useParams();
@@ -87,11 +154,21 @@ export default function SummonerPage() {
   const [loadingStep, setLoadingStep] = useState(0);
   const [progress, setProgress] = useState(0);
   const [errorKey, setErrorKey] = useState<SummonerErrorKey | null>(null);
+  const [dataDragonVersion, setDataDragonVersion] = useState(FALLBACK_DDRAGON_VERSION);
   const [pipeline, setPipeline] = useState<PipelineData | null>(null);
   const [nemesis, setNemesis] = useState<NemesisData | null>(null);
   const [champions, setChampions] = useState<ChampionStats[]>([]);
   const [selectedChampion, setSelectedChampion] = useState<ChampionStats | null>(null);
+  const [selectedChampionMatchups, setSelectedChampionMatchups] = useState<MatchupStats[]>([]);
+  const [matchupsLoading, setMatchupsLoading] = useState(false);
+  const [matchupsError, setMatchupsError] = useState(false);
   const [listMode, setListMode] = useState<'worst' | 'best' | null>(null);
+  const [rankingClassFilter, setRankingClassFilter] = useState(ALL_FILTER_VALUE);
+  const [rankingResultFilter, setRankingResultFilter] = useState<ResultFilter>('all');
+  const [rankingSort, setRankingSort] = useState<SortMode>('games');
+  const [matchupClassFilter, setMatchupClassFilter] = useState(ALL_FILTER_VALUE);
+  const [matchupResultFilter, setMatchupResultFilter] = useState<ResultFilter>('all');
+  const [matchupSort, setMatchupSort] = useState<SortMode>('games');
   const { language, t, toggleLanguage } = useLanguage();
   const dashboard = t.summoner;
 
@@ -144,6 +221,76 @@ export default function SummonerPage() {
     };
   }, [gameName, tagLine]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function fetchDataDragonVersion() {
+      try {
+        const response = await fetch('https://ddragon.leagueoflegends.com/api/versions.json', {
+          signal: controller.signal,
+        });
+        if (!response.ok) return;
+
+        const versions = await response.json() as string[];
+        if (versions[0]) setDataDragonVersion(versions[0]);
+      } catch (error: unknown) {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+      }
+    }
+
+    fetchDataDragonVersion();
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const puuid = pipeline?.summoner.puuid;
+
+    if (!selectedChampion || !puuid) return;
+
+    const controller = new AbortController();
+    const championName = selectedChampion.champion;
+    const summonerPuuid = puuid;
+
+    async function fetchChampionMatchups() {
+      setMatchupsLoading(true);
+      setMatchupsError(false);
+
+      try {
+        const response = await fetch(
+          `${API}/nemesis/${encodeURIComponent(summonerPuuid)}/champion/${encodeURIComponent(championName)}`,
+          { signal: controller.signal },
+        );
+
+        if (!response.ok) throw new Error('matchupsFailed');
+
+        const data = await response.json() as MatchupStats[];
+        setSelectedChampionMatchups(data.filter((matchup) => getMatchupTotal(matchup) > 0));
+      } catch (error: unknown) {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+
+        setSelectedChampionMatchups([]);
+        setMatchupsError(true);
+      } finally {
+        if (!controller.signal.aborted) setMatchupsLoading(false);
+      }
+    }
+
+    fetchChampionMatchups();
+    return () => controller.abort();
+  }, [pipeline?.summoner.puuid, selectedChampion]);
+
+  function handleChampionSelection(champion: ChampionStats) {
+    const nextChampion = selectedChampion?.champion === champion.champion ? null : champion;
+
+    setSelectedChampion(nextChampion);
+    setSelectedChampionMatchups([]);
+    setMatchupsLoading(Boolean(nextChampion));
+    setMatchupsError(false);
+    setMatchupClassFilter(ALL_FILTER_VALUE);
+    setMatchupResultFilter('all');
+    setMatchupSort('games');
+  }
+
   if (loading || errorKey) {
     return (
       <div className="loading-root">
@@ -184,12 +331,32 @@ export default function SummonerPage() {
   const overallWinrate = stats?.winrate ?? 0;
   const topNemesis = nemesis?.nemesis;
   const classStats = nemesis?.class_stats || [];
-  const bestChamp = nemesis?.champion_stats?.find(
-    (champion) => champion.winrate === Math.max(...(nemesis?.champion_stats.map((item) => item.winrate) || [0])),
+  const globalMatchups = (nemesis?.champion_stats || []).filter((matchup) => getMatchupTotal(matchup) > 0);
+  const bestChamp = [...globalMatchups].sort((a, b) => compareMatchups(a, b, 'best'))[0];
+  const rankingClassOptions = getClassOptions(globalMatchups);
+  const matchupClassOptions = getClassOptions(selectedChampionMatchups);
+  const filteredRankingMatchups = filterAndSortMatchups(
+    globalMatchups,
+    rankingClassFilter,
+    rankingResultFilter,
+    rankingSort,
   );
-
-  const sortedWorst = [...(nemesis?.champion_stats || [])].sort((a, b) => a.winrate - b.winrate);
-  const sortedBest = [...(nemesis?.champion_stats || [])].sort((a, b) => b.winrate - a.winrate);
+  const filteredSelectedChampionMatchups = filterAndSortMatchups(
+    selectedChampionMatchups,
+    matchupClassFilter,
+    matchupResultFilter,
+    matchupSort,
+  );
+  const sortLabels: Record<SortMode, string> = {
+    games: dashboard.filters.mostGames,
+    worst: dashboard.filters.worstWinRate,
+    best: dashboard.filters.bestWinRate,
+  };
+  const rankingTitle = rankingSort === 'games'
+    ? dashboard.gamesRanking
+    : rankingSort === 'best'
+      ? dashboard.bestRanking
+      : dashboard.worstRanking;
 
   return (
     <div className="dash-root">
@@ -214,11 +381,17 @@ export default function SummonerPage() {
         </header>
 
         <section className="spotlight-section">
-          <div className="spotlight-card nemesis-card" onClick={() => setListMode(listMode === 'worst' ? null : 'worst')}>
+          <div
+            className="spotlight-card nemesis-card"
+            onClick={() => {
+              setRankingSort('worst');
+              setListMode(listMode === 'worst' ? null : 'worst');
+            }}
+          >
             <span className="card-eyebrow">{dashboard.mortalEnemy}</span>
             {topNemesis ? (
               <>
-                <Image className="champ-icon" src={getChampionIcon(topNemesis.champion)} alt={topNemesis.champion} width={80} height={80} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
+                <Image className="champ-icon" src={getChampionIcon(topNemesis.champion, dataDragonVersion)} alt={topNemesis.champion} width={80} height={80} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
                 <p className="champ-name">{topNemesis.champion}</p>
                 <p className="champ-class">{getChampionClassLabel(topNemesis.class, language)}</p>
                 <p className="champ-wr wr-negative">{topNemesis.winrate}% {t.common.winRate}</p>
@@ -228,11 +401,17 @@ export default function SummonerPage() {
             <span className="card-hint">{dashboard.clickRanking}</span>
           </div>
 
-          <div className="spotlight-card best-card" onClick={() => setListMode(listMode === 'best' ? null : 'best')}>
+          <div
+            className="spotlight-card best-card"
+            onClick={() => {
+              setRankingSort('best');
+              setListMode(listMode === 'best' ? null : 'best');
+            }}
+          >
             <span className="card-eyebrow">{dashboard.bestWinRate}</span>
             {bestChamp ? (
               <>
-                <Image className="champ-icon" src={getChampionIcon(bestChamp.opponent_champion)} alt={bestChamp.opponent_champion} width={80} height={80} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
+                <Image className="champ-icon" src={getChampionIcon(bestChamp.opponent_champion, dataDragonVersion)} alt={bestChamp.opponent_champion} width={80} height={80} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
                 <p className="champ-name">{bestChamp.opponent_champion}</p>
                 <p className="champ-class">{getChampionClassLabel(bestChamp.class, language)}</p>
                 <p className="champ-wr wr-positive">{bestChamp.winrate}% {t.common.winRate}</p>
@@ -245,20 +424,63 @@ export default function SummonerPage() {
 
         {listMode && (
           <section className="list-section">
-            <h3 className="section-title">{listMode === 'worst' ? dashboard.worstRanking : dashboard.bestRanking}</h3>
-            <div className="champ-list">
-              {(listMode === 'worst' ? sortedWorst : sortedBest).map((c) => (
-                <div key={c.opponent_champion} className="list-row">
-                  <Image className="list-icon" src={getChampionIcon(c.opponent_champion)} alt={c.opponent_champion} width={36} height={36} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
-                  <span className="list-name">{c.opponent_champion}</span>
-                  <span className="list-class">{getChampionClassLabel(c.class, language)}</span>
-                  <span className="list-record">{formatCompactRecord(c.wins, c.losses, language)}</span>
-                  <span className={`list-wr ${c.winrate >= 50 ? 'wr-positive' : 'wr-negative'}`}>{c.winrate}%</span>
-                  <div className="list-bar-track">
-                    <div className="list-bar" style={{ width: `${c.winrate}%`, background: c.winrate >= 50 ? '#4A9B6F' : '#C84B4B' }} />
-                  </div>
+            <h3 className="section-title">{rankingTitle}</h3>
+            <div className="filter-bar">
+              <label className="filter-field">
+                <span>{dashboard.filters.class}</span>
+                <select className="filter-select" value={rankingClassFilter} onChange={(event) => setRankingClassFilter(event.target.value)}>
+                  <option value={ALL_FILTER_VALUE}>{dashboard.filters.allClasses}</option>
+                  {rankingClassOptions.map((championClass) => (
+                    <option key={championClass} value={championClass}>
+                      {getChampionClassLabel(championClass, language)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="filter-field">
+                <span>{dashboard.filters.result}</span>
+                <select className="filter-select" value={rankingResultFilter} onChange={(event) => setRankingResultFilter(event.target.value as ResultFilter)}>
+                  <option value="all">{dashboard.filters.allResults}</option>
+                  <option value="winning">{dashboard.filters.winning}</option>
+                  <option value="losing">{dashboard.filters.losing}</option>
+                </select>
+              </label>
+
+              <div className="filter-field filter-sort">
+                <span>{dashboard.filters.sort}</span>
+                <div className="segmented-control">
+                  {(['games', 'worst', 'best'] as SortMode[]).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      className={`segment-button ${rankingSort === mode ? 'active' : ''}`}
+                      onClick={() => setRankingSort(mode)}
+                    >
+                      {sortLabels[mode]}
+                    </button>
+                  ))}
                 </div>
-              ))}
+              </div>
+            </div>
+
+            <div className="champ-list">
+              {filteredRankingMatchups.length > 0 ? (
+                filteredRankingMatchups.map((c) => (
+                  <div key={c.opponent_champion} className="list-row">
+                    <Image className="list-icon" src={getChampionIcon(c.opponent_champion, dataDragonVersion)} alt={c.opponent_champion} width={36} height={36} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
+                    <span className="list-name">{c.opponent_champion}</span>
+                    <span className="list-class">{getChampionClassLabel(c.class, language)}</span>
+                    <span className="list-record">{formatCompactRecord(c.wins, c.losses, language)}</span>
+                    <span className={`list-wr ${c.winrate >= 50 ? 'wr-positive' : 'wr-negative'}`}>{c.winrate}%</span>
+                    <div className="list-bar-track">
+                      <div className="list-bar" style={{ width: `${c.winrate}%`, background: c.winrate >= 50 ? '#4A9B6F' : '#C84B4B' }} />
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="empty-state">{dashboard.filters.noMatches}</p>
+              )}
             </div>
           </section>
         )}
@@ -283,8 +505,8 @@ export default function SummonerPage() {
           <h3 className="section-title">{dashboard.playedChampions}</h3>
           <div className="played-grid">
             {champions.map((c) => (
-              <div key={c.champion} className={`played-card ${selectedChampion?.champion === c.champion ? 'active' : ''}`} onClick={() => setSelectedChampion(selectedChampion?.champion === c.champion ? null : c)}>
-                <Image className="played-icon" src={getChampionIcon(c.champion)} alt={c.champion} width={56} height={56} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
+              <div key={c.champion} className={`played-card ${selectedChampion?.champion === c.champion ? 'active' : ''}`} onClick={() => handleChampionSelection(c)}>
+                <Image className="played-icon" src={getChampionIcon(c.champion, dataDragonVersion)} alt={c.champion} width={56} height={56} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
                 <p className="played-name">{c.champion}</p>
                 <p className={`played-wr ${c.winrate >= 50 ? 'wr-positive' : 'wr-negative'}`}>{c.winrate}%</p>
                 <p className="played-record">{formatCompactRecord(c.wins, c.losses, language)}</p>
@@ -296,13 +518,54 @@ export default function SummonerPage() {
         {selectedChampion && (
           <section className="matchup-section">
             <h3 className="section-title">{dashboard.matchupsPlaying} {selectedChampion.champion}</h3>
+            <div className="filter-bar">
+              <label className="filter-field">
+                <span>{dashboard.filters.class}</span>
+                <select className="filter-select" value={matchupClassFilter} onChange={(event) => setMatchupClassFilter(event.target.value)}>
+                  <option value={ALL_FILTER_VALUE}>{dashboard.filters.allClasses}</option>
+                  {matchupClassOptions.map((championClass) => (
+                    <option key={championClass} value={championClass}>
+                      {getChampionClassLabel(championClass, language)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="filter-field">
+                <span>{dashboard.filters.result}</span>
+                <select className="filter-select" value={matchupResultFilter} onChange={(event) => setMatchupResultFilter(event.target.value as ResultFilter)}>
+                  <option value="all">{dashboard.filters.allResults}</option>
+                  <option value="winning">{dashboard.filters.winning}</option>
+                  <option value="losing">{dashboard.filters.losing}</option>
+                </select>
+              </label>
+
+              <div className="filter-field filter-sort">
+                <span>{dashboard.filters.sort}</span>
+                <div className="segmented-control">
+                  {(['games', 'worst', 'best'] as SortMode[]).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      className={`segment-button ${matchupSort === mode ? 'active' : ''}`}
+                      onClick={() => setMatchupSort(mode)}
+                    >
+                      {sortLabels[mode]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             <div className="champ-list">
-              {(nemesis?.champion_stats || [])
-                .filter((c) => c.wins + c.losses > 0)
-                .sort((a, b) => a.winrate - b.winrate)
-                .map((c) => (
+              {matchupsLoading ? (
+                <p className="empty-state">{dashboard.filters.loadingMatchups}</p>
+              ) : matchupsError ? (
+                <p className="empty-state error-text">{dashboard.filters.matchupsError}</p>
+              ) : filteredSelectedChampionMatchups.length > 0 ? (
+                filteredSelectedChampionMatchups.map((c) => (
                   <div key={c.opponent_champion} className="list-row">
-                    <Image className="list-icon" src={getChampionIcon(c.opponent_champion)} alt={c.opponent_champion} width={36} height={36} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
+                    <Image className="list-icon" src={getChampionIcon(c.opponent_champion, dataDragonVersion)} alt={c.opponent_champion} width={36} height={36} unoptimized onError={(e) => (e.currentTarget.src = '/fallback.png')} />
                     <span className="list-name">{c.opponent_champion}</span>
                     <span className="list-class">{getChampionClassLabel(c.class, language)}</span>
                     <span className="list-record">{formatCompactRecord(c.wins, c.losses, language)}</span>
@@ -311,7 +574,10 @@ export default function SummonerPage() {
                       <div className="list-bar" style={{ width: `${c.winrate}%`, background: c.winrate >= 50 ? '#4A9B6F' : '#C84B4B' }} />
                     </div>
                   </div>
-                ))}
+                ))
+              ) : (
+                <p className="empty-state">{dashboard.filters.noMatches}</p>
+              )}
             </div>
           </section>
         )}
@@ -545,6 +811,86 @@ function Style() {
         margin-bottom: 1rem;
       }
 
+      .filter-bar {
+        display: flex;
+        align-items: flex-end;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+        padding: 0.75rem;
+        background: rgba(10,20,30,0.45);
+        border: 1px solid rgba(200,155,60,0.08);
+        border-radius: 2px;
+      }
+
+      .filter-field {
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+        min-width: 150px;
+      }
+
+      .filter-field span {
+        font-size: 0.65rem;
+        letter-spacing: 0.12em;
+        color: #5B5A56;
+        text-transform: uppercase;
+      }
+
+      .filter-select {
+        height: 2.2rem;
+        border: 1px solid rgba(200,155,60,0.18);
+        border-radius: 2px;
+        background: rgba(3,10,15,0.9);
+        color: #F0E6D3;
+        font-family: 'Raleway', sans-serif;
+        font-size: 0.75rem;
+        padding: 0 0.65rem;
+        outline: none;
+      }
+
+      .filter-select:focus {
+        border-color: rgba(200,155,60,0.55);
+      }
+
+      .filter-sort {
+        flex: 1;
+        min-width: 280px;
+      }
+
+      .segmented-control {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        min-height: 2.2rem;
+        border: 1px solid rgba(200,155,60,0.18);
+        border-radius: 2px;
+        overflow: hidden;
+      }
+
+      .segment-button {
+        border: none;
+        border-right: 1px solid rgba(200,155,60,0.12);
+        background: rgba(3,10,15,0.72);
+        color: #5B5A56;
+        font-family: 'Raleway', sans-serif;
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        cursor: pointer;
+        transition: background 0.2s, color 0.2s;
+      }
+
+      .segment-button:last-child {
+        border-right: none;
+      }
+
+      .segment-button:hover,
+      .segment-button.active {
+        background: rgba(200,155,60,0.14);
+        color: #C89B3C;
+      }
+
       .champ-list {
         display: flex;
         flex-direction: column;
@@ -581,8 +927,10 @@ function Style() {
 
       .class-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 1rem;
+        max-width: 780px;
+        margin: 0 auto;
       }
 
       .class-card {
@@ -630,9 +978,12 @@ function Style() {
       .played-record { font-size: 0.65rem; color: #5B5A56; }
 
       .no-data { color: #3A3935; font-size: 0.8rem; }
+      .empty-state { color: #5B5A56; font-size: 0.8rem; padding: 1rem; }
 
       @media (max-width: 600px) {
         .spotlight-section { grid-template-columns: 1fr; }
+        .filter-field, .filter-sort { width: 100%; min-width: 0; }
+        .class-grid { grid-template-columns: 1fr; max-width: none; }
         .list-row { grid-template-columns: 36px 1fr 60px 50px; }
         .list-class, .list-bar-track { display: none; }
       }
